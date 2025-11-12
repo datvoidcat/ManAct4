@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package mutex;
+option go_package = "proto/mutex";
+
+service MutexService {
+  rpc RequestAccess(RequestMessage) returns (ReplyMessage) {}
+}
+
+message RequestMessage {
+  int32 node_id = 1;
+  int64 timestamp = 2;
+}
+
+message ReplyMessage {
+  bool ok = 1;
+}
