@@ -20,6 +20,7 @@ type Node struct {
 	ReplyCount      int
 	Peers           map[int32]string // nodeID -> address
 	Clients         map[int32]pb.MutexServiceClient
+	PendingReplies  map[int32]chan struct{}
 	mu              sync.Mutex
 	pb.UnimplementedMutexServiceServer
 }
@@ -31,6 +32,7 @@ func NewNode(id int32, peers map[int32]string) *Node {
 		RequestingCS:    false,
 		InCS:            false,
 		DeferredReplies: make([]int32, 0),
+		PendingReplies:  make(map[int32]chan struct{}),
 		Peers:           peers,
 		Clients:         make(map[int32]pb.MutexServiceClient),
 	}
@@ -54,18 +56,25 @@ func (n *Node) ConnectToPeers() error {
 // RequestAccess handles incoming request messages from other nodes
 func (n *Node) RequestAccess(ctx context.Context, req *pb.RequestMessage) (*pb.ReplyMessage, error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	log.Printf("Node %d received request from Node %d with timestamp %d", n.ID, req.NodeId, req.Timestamp)
 
-	// If we're in CS or requesting it and have higher priority, defer reply
+	// Instead of immediately returning a negative reply, keep the request blocked
+	// and signal it after exiting the critical section.
 	if n.InCS || (n.RequestingCS && (n.RequestTime < req.Timestamp ||
 		(n.RequestTime == req.Timestamp && n.ID < req.NodeId))) {
+		// create a channel to signal the deferred reply
+		ch := make(chan struct{})
 		n.DeferredReplies = append(n.DeferredReplies, req.NodeId)
+		n.PendingReplies[req.NodeId] = ch
 		log.Printf("Node %d deferred reply to Node %d", n.ID, req.NodeId)
-		return &pb.ReplyMessage{Ok: false}, nil
+		n.mu.Unlock()
+
+		// wait until exitCriticalSection signals
+		<-ch
+		return &pb.ReplyMessage{Ok: true}, nil
 	}
 
+	n.mu.Unlock()
 	// Otherwise, reply immediately
 	log.Printf("Node %d sending OK to Node %d", n.ID, req.NodeId)
 	return &pb.ReplyMessage{Ok: true}, nil
@@ -122,25 +131,18 @@ func (n *Node) enterCriticalSection() {
 // exitCriticalSection is called when a node is done with the critical section
 func (n *Node) exitCriticalSection() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	// mark not in CS first
 	n.InCS = false
 	log.Printf("Node %d exiting critical section", n.ID)
 
-	// Send deferred replies
+	// Signal all pending deferred requests so their RPC handlers return OK
 	for _, nodeId := range n.DeferredReplies {
-		if client, ok := n.Clients[nodeId]; ok {
-			go func(id int32, c pb.MutexServiceClient) {
-				req := &pb.RequestMessage{
-					NodeId:    id,
-					Timestamp: time.Now().UnixNano(),
-				}
-				_, err := c.RequestAccess(context.Background(), req)
-				if err != nil {
-					log.Printf("Error sending deferred reply to Node %d: %v", id, err)
-				}
-			}(nodeId, client)
+		if ch, ok := n.PendingReplies[nodeId]; ok {
+			// signal the waiting RequestAccess handler
+			close(ch)
+			delete(n.PendingReplies, nodeId)
 		}
 	}
 	n.DeferredReplies = make([]int32, 0)
+	n.mu.Unlock()
 }
